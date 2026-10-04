@@ -1,14 +1,16 @@
 /**
- * useRatingFit：水位流量点据拟合、残差与定线状态管理。
- * 被关系点据页与导出页消费；点据数据来自 ratingStore（IndexedDB 实时订阅）。
+ * useRatingFit：水位流量点据拟合、残差与定线状态管理（整编室视图）。
+ * 被关系点据页与导出页消费；点据数据来自 ratingStore（整编库 IndexedDB 实时订阅）。
+ * 仅正常点据参与拟合；挂起点据单列，等人复核、不挡其他点据。
  */
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRatingStore } from '@/stores/ratingStore'
-import type { Compare } from '@/types/compare'
+import type { Compare, CompareConclusion } from '@/types/compare'
 import {
   curveFlow,
   fitPowerCurve,
+  isRatingActive,
   type Rating,
   type RatingFitResult
 } from '@/types/rating'
@@ -33,6 +35,7 @@ export interface RatingPointRow {
 export interface UseRatingFitResult {
   ratings: Ref<Rating[]>
   compares: Ref<Compare[]>
+  conclusions: Ref<CompareConclusion[]>
   /** 参与定线的定线号列表 */
   lineNos: ComputedRef<string[]>
   /** 当前选中定线号 */
@@ -41,17 +44,19 @@ export interface UseRatingFitResult {
   fit: ComputedRef<RatingFitResult>
   /** 全部定线的拟合结果 */
   allFits: ComputedRef<RatingFitResult[]>
-  /** 当前定线的点据（含残差） */
+  /** 当前定线的点据（含残差；挂起点据残差为 0 且不参与拟合） */
   pointRows: ComputedRef<RatingPointRow[]>
   /** 当前定线的曲线采样点，用于绘制曲线 */
   curveSamples: ComputedRef<CurveSample[]>
+  /** 待复核的挂起点据 */
+  suspendedRows: ComputedRef<RatingPointRow[]>
   /** 超限点据清单 */
   overLimitRows: ComputedRef<RatingPointRow[]>
   /** 超限点据对应的比测记录 */
   overLimitCompares: ComputedRef<Compare[]>
   setActiveLine: (lineNo: string) => void
-  /** 按当前点据重算定线参数并回写 store */
-  refit: () => RatingFitResult
+  /** 按当前点据重算定线参数、比测结论并追加结论版本 */
+  refit: () => Promise<number>
 }
 
 /**
@@ -59,7 +64,7 @@ export interface UseRatingFitResult {
  */
 export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   const ratingStore = useRatingStore()
-  const { ratings, compares } = storeToRefs(ratingStore)
+  const { ratings, compares, conclusions } = storeToRefs(ratingStore)
   const activeLineNo = ref<string>(initialLineNo)
 
   const lineNos = computed<string[]>(() => {
@@ -77,7 +82,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
       const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
+        .filter((rating) => rating.lineNo === lineNo && isRatingActive(rating))
         .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
       return fitPowerCurve(points, lineNo)
     })
@@ -95,9 +100,10 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
       .filter((rating) => rating.lineNo === activeLineNo.value)
       .sort((a, b) => a.stageM - b.stageM)
       .map((rating) => {
-        const predicted = current.valid ? curveFlow(current, rating.stageM) : 0
+        const active = isRatingActive(rating)
+        const predicted = current.valid && active ? curveFlow(current, rating.stageM) : 0
         const residualPct =
-          current.valid && rating.flowM3s > 0
+          current.valid && active && rating.flowM3s > 0
             ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
             : 0
         return {
@@ -112,7 +118,7 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
 
   const curveSamples = computed<CurveSample[]>(() => {
     const current = fit.value
-    const rows = pointRows.value
+    const rows = pointRows.value.filter((row) => isRatingActive(row.rating))
     if (!current.valid || rows.length === 0) return []
     const stages = rows.map((row) => row.rating.stageM)
     const min = Math.min(...stages)
@@ -124,11 +130,15 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
     })
   })
 
+  const suspendedRows = computed<RatingPointRow[]>(() =>
+    pointRows.value.filter((row) => !isRatingActive(row.rating))
+  )
+
   const overLimitRows = computed<RatingPointRow[]>(() => {
     const limit = ratingStore.deviationLimitPct
     return allFits.value.flatMap((item) =>
       ratings.value
-        .filter((rating) => rating.lineNo === item.lineNo)
+        .filter((rating) => rating.lineNo === item.lineNo && isRatingActive(rating))
         .map((rating) => {
           const predicted = item.valid ? curveFlow(item, rating.stageM) : 0
           const residualPct =
@@ -155,24 +165,21 @@ export function useRatingFit(initialLineNo = 'A'): UseRatingFitResult {
     activeLineNo.value = lineNo
   }
 
-  function refit(): RatingFitResult {
-    const points = ratings.value
-      .filter((rating) => rating.lineNo === activeLineNo.value)
-      .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
-    const result = fitPowerCurve(points, activeLineNo.value)
-    ratingStore.setFit(result)
-    return result
+  async function refit(): Promise<number> {
+    return ratingStore.rebuildCompares(activeLineNo.value)
   }
 
   return {
     ratings,
     compares,
+    conclusions,
     lineNos,
     activeLineNo,
     fit,
     allFits,
     pointRows,
     curveSamples,
+    suspendedRows,
     overLimitRows,
     overLimitCompares,
     setActiveLine,

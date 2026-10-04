@@ -6,7 +6,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Right, Timer } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Promotion, Right, Timer } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
@@ -60,6 +60,7 @@ const stats = computed(() => {
     (sum, section) => sum + (sectionStore.sectionVerticalCounts[section.id] ?? 0),
     0
   )
+  const reportedCount = list.filter((section) => sectionStore.dischargeOfSection(section.id)?.reported).length
   return {
     count: list.length,
     maxStageM: stages.length ? Math.max(...stages) : null,
@@ -69,9 +70,33 @@ const stats = computed(() => {
       return Date.parse(section.measuredAt) > Date.parse(acc.measuredAt) ? section : acc
     }, null),
     verticalCount,
+    reportedCount,
     currentStageM: list.length ? list[0].stageM : null
   }
 })
+
+/** 外业组断面流量成果：垂线测点一改即自动重算，整编室只读已报出的版本 */
+function dischargeOf(section: Section) {
+  return sectionStore.dischargeOfSection(section.id)
+}
+
+async function reportSection(section: Section): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `把测次「${section.measureNo}」当前算出的断面流量报送给整编室？报送只在本侧成果上登记，整编室据此落点据；报送后若再改垂线 / 测点，整编室引用该测次的点据会先挂起等人复核。`,
+      '报出断面流量',
+      { type: 'info', confirmButtonText: '报出', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  const reported = await sectionStore.reportDischarge(section.id)
+  if (!reported) {
+    ElMessage.warning('该测次还没有算出有效的断面流量（至少需要一条垂线与测点）')
+    return
+  }
+  ElMessage.success(`测次 ${section.measureNo} 断面流量 ${reported.flowM3s.toFixed(2)} m³/s 已报出整编室`)
+}
 
 function openCreate(): void {
   editingId.value = null
@@ -243,6 +268,7 @@ onMounted(() => {
           icon="TrendCharts"
         />
         <StatBadge label="垂线合计" :value="stats.verticalCount" suffix="条" tone="success" icon="Histogram" />
+        <StatBadge label="已报出成果" :value="stats.reportedCount" suffix="次" tone="warning" icon="Promotion" />
       </div>
 
       <FilterBar
@@ -298,14 +324,36 @@ onMounted(() => {
             </el-button>
           </template>
         </el-table-column>
+        <el-table-column label="断面流量 (m³/s)" width="150" align="right">
+          <template #default="{ row }">
+            <span v-if="dischargeOf(row)" class="gb-mono">{{ dischargeOf(row)?.flowM3s.toFixed(2) }}</span>
+            <span v-else class="gb-hint">未算出</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="报送状态" width="110" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="dischargeOf(row)?.reported" size="small" type="success" effect="plain">已报出</el-tag>
+            <el-tag v-else-if="dischargeOf(row)" size="small" type="info" effect="plain">外业自存</el-tag>
+            <el-tag v-else size="small" type="warning" effect="plain">待计算</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="测流时间" min-width="170">
           <template #default="{ row }">
             <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoVerticals(row)">垂线</el-button>
+            <el-button
+              size="small"
+              :type="dischargeOf(row)?.reported ? 'success' : 'warning'"
+              plain
+              :icon="Promotion"
+              @click="reportSection(row)"
+            >
+              {{ dischargeOf(row)?.reported ? '重报' : '报出' }}
+            </el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeSection(row)">删除</el-button>
           </template>
@@ -317,7 +365,8 @@ onMounted(() => {
 
       <p class="gb-hint">
         <el-icon><Timer /></el-icon>
-        提示：测次的水位将参与水位流量关系点据定线；同一测次下的垂线按起点距升序参与部分面积法流量计算。
+        提示：断面流量由本侧垂线测点自动算出并归外业组持有；点「报出」后整编室才能按该测次落点据，
+        报出后再改垂线 / 测点会自动升成果版本，整编室引用旧版的点据会先挂起等人复核，不挡别的点据。
       </p>
     </template>
 

@@ -5,11 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { DataLine, Files, Histogram, Odometer, PieChart, Promotion, TrendCharts } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
-import { DB_NAME, DB_VERSION } from '@/utils/db'
+import { FIELD_DB_NAME, OFFICE_DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
@@ -32,8 +32,13 @@ const activeKey = computed(() => {
 })
 
 const navItems = computed(() => [
-  { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
-  { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
+  { key: '/stations', label: '外业·测流台账', icon: Odometer, badge: String(stationStore.stations.length) },
+  {
+    key: '/ratings',
+    label: '整编·定线点据',
+    icon: TrendCharts,
+    badge: ratingStore.suspendedRatings.length > 0 ? `挂${ratingStore.suspendedRatings.length}` : String(ratingStore.ratings.length)
+  },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
 
@@ -70,7 +75,7 @@ function go(path: string): void {
         <span class="app-header__mark">水</span>
         <div>
           <h1 class="app-header__title">水文站流量测验与绳套曲线台</h1>
-          <p class="app-header__sub">测站 · 断面测次 · 垂线测深 · 流速测点 · 水位流量关系定线 · 比测偏差</p>
+          <p class="app-header__sub">外业组：测次 · 垂线测深 · 流速测点 · 断面流量　|　整编室：定线号 · 关系点据 · 比测结论</p>
         </div>
       </div>
       <nav class="app-nav">
@@ -111,12 +116,13 @@ function go(path: string): void {
 
     <footer class="app-footer">
       <span>
-        本地库 {{ DB_NAME }} · 结构版本 v{{ DB_VERSION }} · 数据仅存于本浏览器 IndexedDB，不上传任何服务器。
+        外业库 {{ FIELD_DB_NAME }} · 整编库 {{ OFFICE_DB_NAME }} · 结构版本 v{{ DB_VERSION }} ·
+        两侧分库互不回写，数据仅存于本浏览器 IndexedDB，不上传任何服务器。
       </span>
       <span>
-        测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
-        {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
-        {{ ratingStore.ratings.length }}
+        测次 {{ sectionStore.sections.length }} · 成果 {{ sectionStore.discharges.length }} · 测点
+        {{ sectionStore.points.length }} · 点据 {{ ratingStore.ratings.length }}（挂起
+        {{ ratingStore.suspendedRatings.length }}）
       </span>
     </footer>
   </div>

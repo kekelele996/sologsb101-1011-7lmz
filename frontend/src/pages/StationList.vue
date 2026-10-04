@@ -50,12 +50,14 @@ const stationCards = computed(() =>
   stationStore.filteredStations.map((station) => {
     const stats = stationStore.sectionStats[station.id] ?? { count: 0, latestStageM: null, latestMeasuredAt: null }
     const ratings = ratingStore.ratings.filter((rating) => rating.stationId === station.id)
-    const ratingIds = new Set(ratings.map((rating) => rating.id))
-    const compares = ratingStore.compares.filter((compare) => ratingIds.has(compare.ratingId))
+    const activeRatings = ratings.filter((rating) => rating.status === '正常')
+    const activeIds = new Set(activeRatings.map((rating) => rating.id))
+    const compares = ratingStore.compares.filter((compare) => activeIds.has(compare.ratingId))
     const overLimit = compares.filter((compare) => compare.verdict === '超限').length
+    const suspendedCount = ratings.length - activeRatings.length
     const qualifyRate =
       compares.length === 0 ? 0 : Number((((compares.length - overLimit) / compares.length) * 100).toFixed(0))
-    return { station, stats, ratingCount: ratings.length, overLimit, qualifyRate }
+    return { station, stats, ratingCount: activeRatings.length, suspendedCount, overLimit, qualifyRate }
   })
 )
 
@@ -304,6 +306,9 @@ watch(
         <div class="station-card__meta">
           <span>集水面积 <b class="gb-mono">{{ card.station.catchmentKm2 }}</b> km²</span>
           <span>关系点据 <b class="gb-mono">{{ card.ratingCount }}</b> 个</span>
+          <span v-if="card.suspendedCount > 0" class="station-card__alert station-card__alert--suspended">
+            <el-icon><Warning /></el-icon> 挂起待核 <b class="gb-mono">{{ card.suspendedCount }}</b> 条
+          </span>
           <span v-if="card.overLimit > 0" class="station-card__alert">
             <el-icon><Warning /></el-icon> 超限 <b class="gb-mono">{{ card.overLimit }}</b> 条
           </span>
@@ -458,6 +463,10 @@ watch(
   align-items: center;
   gap: 4px;
   color: #c0392b;
+}
+
+.station-card__alert--suspended {
+  color: #7f8c8d;
 }
 
 .station-card__remark {

@@ -1,15 +1,22 @@
 /**
- * 断面 store：维护断面测次、垂线集合、测点缓存与录入草稿。
+ * 断面 store（外业组）：维护断面测次、垂线集合、测点缓存、录入草稿与断面流量成果。
+ *
+ * 归属：测次 / 垂线测深 / 流速测点 / 断面流量全部只在外业库；整编室只读流量成果快照。
+ * - 垂线或测点一变动，自动重算本测次断面流量；若该成果已报出，成果版本 +1，
+ *   整编室对账时会把引用旧版本的点据挂起等人复核（不挡别的点据）。
+ * - 「报出」只在本侧成果上打标记并刷新报出时间，整编室在点据录入时读取快照。
  * 垂线排序按起点距升序，页面展示与流量计算共用同一顺序。
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { db, createId, watchTable } from '@/utils/db'
+import { fieldDb, createId, watchTable, recomputeDischarge } from '@/utils/db'
 import type { Section } from '@/types/section'
 import { createEmptySectionFilter, type SectionFilterState } from '@/types/section'
 import type { Vertical } from '@/types/vertical'
 import { buildRelativeDepths } from '@/types/vertical'
 import type { Point } from '@/types/point'
+import type { Discharge } from '@/types/discharge'
+import { isDischargeUsable } from '@/types/discharge'
 
 /** 垂线录入草稿（新增/编辑表单共享结构） */
 export interface VerticalDraft {
@@ -41,6 +48,7 @@ export const useSectionStore = defineStore('section', () => {
   const sections = ref<Section[]>([])
   const verticals = ref<Vertical[]>([])
   const points = ref<Point[]>([])
+  const discharges = ref<Discharge[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
   const currentSectionId = ref<string | null>(null)
@@ -56,16 +64,19 @@ export const useSectionStore = defineStore('section', () => {
   function start(): void {
     if (started) return
     started = true
-    watchTable<Section>(() => db.sections).subscribe((rows) => {
+    watchTable<Section>(() => fieldDb.sections).subscribe((rows) => {
       sections.value = rows
       ready.value = true
       error.value = null
     })
-    watchTable<Vertical>(() => db.verticals).subscribe((rows) => {
+    watchTable<Vertical>(() => fieldDb.verticals).subscribe((rows) => {
       verticals.value = rows
     })
-    watchTable<Point>(() => db.points).subscribe((rows) => {
+    watchTable<Point>(() => fieldDb.points).subscribe((rows) => {
       points.value = rows
+    })
+    watchTable<Discharge>(() => fieldDb.discharges).subscribe((rows) => {
+      discharges.value = rows
     })
   }
 
@@ -96,6 +107,16 @@ export const useSectionStore = defineStore('section', () => {
 
   const sectionById = (id: string | null | undefined): Section | null =>
     id ? sections.value.find((section) => section.id === id) ?? null : null
+
+  /** 某测次已落库的断面流量成果（无则 null：尚未算出） */
+  const dischargeOfSection = (sectionId: string | null | undefined): Discharge | null =>
+    sectionId ? discharges.value.find((discharge) => discharge.sectionId === sectionId) ?? null : null
+
+  /** 某测次成果是否已具备送交整编室的条件（算出且流量为正） */
+  function isSectionReadyToReport(sectionId: string): boolean {
+    const discharge = dischargeOfSection(sectionId)
+    return !!discharge && isDischargeUsable(discharge)
+  }
 
   /** 某断面下的垂线：按起点距升序（起点距排序校验的基础） */
   function verticalsOfSection(sectionId: string | null | undefined): Vertical[] {
@@ -183,23 +204,46 @@ export const useSectionStore = defineStore('section', () => {
   ): Promise<Section> {
     const now = Date.now()
     const row: Section = { ...payload, id: createId('sec'), createdAt: now, updatedAt: now }
-    await db.sections.put(row)
+    await fieldDb.sections.put(row)
     return row
   }
 
   async function updateSection(id: string, patch: Partial<Section>): Promise<void> {
-    await db.sections.update(id, { ...patch, updatedAt: Date.now() } as never)
+    await fieldDb.sections.update(id, { ...patch, updatedAt: Date.now() } as never)
   }
 
   async function removeSection(id: string): Promise<void> {
-    await db.transaction('rw', [db.sections, db.verticals, db.points], async () => {
-      const verticalIds = (await db.verticals.where('sectionId').equals(id).toArray()).map((row) => row.id)
-      if (verticalIds.length > 0) {
-        await db.points.where('verticalId').anyOf(verticalIds).delete()
-        await db.verticals.bulkDelete(verticalIds)
+    await fieldDb.transaction(
+      'rw',
+      [fieldDb.sections, fieldDb.verticals, fieldDb.points, fieldDb.discharges],
+      async () => {
+        const verticalIds = (await fieldDb.verticals.where('sectionId').equals(id).toArray()).map((row) => row.id)
+        if (verticalIds.length > 0) {
+          await fieldDb.points.where('verticalId').anyOf(verticalIds).delete()
+          await fieldDb.verticals.bulkDelete(verticalIds)
+        }
+        await fieldDb.discharges.where('sectionId').equals(id).delete()
+        await fieldDb.sections.delete(id)
       }
-      await db.sections.delete(id)
-    })
+    )
+  }
+
+  /**
+   * 报出断面流量成果给整编室：只在本侧成果上打报出标记（整编室那份由其自行送交）。
+   * 必须先算出断面流量；报出后再改垂线 / 测点会让新版本对账时挂起引用点据。
+   */
+  async function reportDischarge(sectionId: string): Promise<Discharge | null> {
+    const discharge = await recomputeDischarge(sectionId)
+    if (!discharge || !isDischargeUsable(discharge)) return null
+    const now = Date.now()
+    const reported: Discharge = {
+      ...discharge,
+      reported: true,
+      reportedAt: new Date(now).toISOString(),
+      updatedAt: now
+    }
+    await fieldDb.discharges.put(reported)
+    return reported
   }
 
   /* ------------------------------- 垂线 ------------------------------- */
@@ -210,7 +254,7 @@ export const useSectionStore = defineStore('section', () => {
   ): Promise<Vertical> {
     const now = Date.now()
     const row: Vertical = { ...payload, sectionId, id: createId('vrt'), createdAt: now, updatedAt: now }
-    await db.verticals.put(row)
+    await fieldDb.verticals.put(row)
     // 录入测深后按相对水深自动生成测点行
     const depths = buildRelativeDepths(payload.pointCount)
     const pointRows: Point[] = depths.map((relativeDepth, index) => ({
@@ -223,19 +267,24 @@ export const useSectionStore = defineStore('section', () => {
       createdAt: now + index,
       updatedAt: now + index
     }))
-    if (pointRows.length > 0) await db.points.bulkPut(pointRows)
+    if (pointRows.length > 0) await fieldDb.points.bulkPut(pointRows)
+    await recomputeDischarge(sectionId)
     return row
   }
 
   async function updateVertical(id: string, patch: Partial<Vertical>): Promise<void> {
-    await db.verticals.update(id, { ...patch, updatedAt: Date.now() } as never)
+    await fieldDb.verticals.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const vertical = verticals.value.find((item) => item.id === id)
+    if (vertical) await recomputeDischarge(vertical.sectionId)
   }
 
   async function removeVertical(id: string): Promise<void> {
-    await db.transaction('rw', [db.verticals, db.points], async () => {
-      await db.points.where('verticalId').equals(id).delete()
-      await db.verticals.delete(id)
+    const vertical = verticals.value.find((item) => item.id === id)
+    await fieldDb.transaction('rw', [fieldDb.verticals, fieldDb.points], async () => {
+      await fieldDb.points.where('verticalId').equals(id).delete()
+      await fieldDb.verticals.delete(id)
     })
+    if (vertical) await recomputeDischarge(vertical.sectionId)
   }
 
   /** 按测点数重排该垂线的测点行（保持已有流速值，缺失的补默认） */
@@ -256,11 +305,13 @@ export const useSectionStore = defineStore('section', () => {
         updatedAt: now + index
       }
     })
-    await db.transaction('rw', [db.verticals, db.points], async () => {
-      await db.points.where('verticalId').equals(verticalId).delete()
-      if (rows.length > 0) await db.points.bulkPut(rows)
-      await db.verticals.update(verticalId, { pointCount: rows.length, updatedAt: now } as never)
+    const vertical = verticals.value.find((item) => item.id === verticalId)
+    await fieldDb.transaction('rw', [fieldDb.verticals, fieldDb.points], async () => {
+      await fieldDb.points.where('verticalId').equals(verticalId).delete()
+      if (rows.length > 0) await fieldDb.points.bulkPut(rows)
+      await fieldDb.verticals.update(verticalId, { pointCount: rows.length, updatedAt: now } as never)
     })
+    if (vertical) await recomputeDischarge(vertical.sectionId)
     return rows.length
   }
 
@@ -272,31 +323,37 @@ export const useSectionStore = defineStore('section', () => {
   ): Promise<Point> {
     const now = Date.now()
     const row: Point = { ...payload, verticalId, id: createId('pnt'), createdAt: now, updatedAt: now }
-    await db.points.put(row)
+    await fieldDb.points.put(row)
     await syncVerticalPointCount(verticalId)
     return row
   }
 
   async function updatePoint(id: string, patch: Partial<Point>): Promise<void> {
-    await db.points.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const point = points.value.find((item) => item.id === id)
+    await fieldDb.points.update(id, { ...patch, updatedAt: Date.now() } as never)
+    if (point) await recomputeDischarge(verticalSectionId(point.verticalId))
   }
 
   async function removePoint(id: string): Promise<void> {
     const point = points.value.find((item) => item.id === id)
-    await db.points.delete(id)
-    if (point) await syncVerticalPointCount(point.verticalId)
+    await fieldDb.points.delete(id)
+    if (point) {
+      await syncVerticalPointCount(point.verticalId)
+      await recomputeDischarge(verticalSectionId(point.verticalId))
+    }
   }
 
   /** 批量改写某垂线全部测点流速（批量录入） */
   async function bulkSetVelocity(verticalId: string, velocityMs: number): Promise<number> {
     const now = Date.now()
-    await db.points
+    await fieldDb.points
       .where('verticalId')
       .equals(verticalId)
       .modify((point) => {
         point.velocityMs = velocityMs
         point.updatedAt = now
       })
+    await recomputeDischarge(verticalSectionId(verticalId))
     return pointsOfVertical(verticalId).length
   }
 
@@ -316,17 +373,18 @@ export const useSectionStore = defineStore('section', () => {
       createdAt: now + index,
       updatedAt: now + index
     }))
-    await db.transaction('rw', [db.verticals, db.points], async () => {
-      await db.points.where('verticalId').equals(verticalId).delete()
-      await db.points.bulkPut(records)
-      await db.verticals.update(verticalId, { pointCount: records.length, updatedAt: now } as never)
+    await fieldDb.transaction('rw', [fieldDb.verticals, fieldDb.points], async () => {
+      await fieldDb.points.where('verticalId').equals(verticalId).delete()
+      await fieldDb.points.bulkPut(records)
+      await fieldDb.verticals.update(verticalId, { pointCount: records.length, updatedAt: now } as never)
     })
+    await recomputeDischarge(verticalSectionId(verticalId))
     return records.length
   }
 
   async function syncVerticalPointCount(verticalId: string): Promise<void> {
-    const count = await db.points.where('verticalId').equals(verticalId).count()
-    await db.verticals.update(verticalId, { pointCount: count, updatedAt: Date.now() } as never)
+    const count = await fieldDb.points.where('verticalId').equals(verticalId).count()
+    await fieldDb.verticals.update(verticalId, { pointCount: count, updatedAt: Date.now() } as never)
   }
 
   /** 权重归一化：按测点数平均分配计算权重 */
@@ -334,14 +392,21 @@ export const useSectionStore = defineStore('section', () => {
     const rows = pointsOfVertical(verticalId)
     if (rows.length === 0) return 0
     const weight = Number((1 / rows.length).toFixed(4))
-    await db.points.bulkPut(rows.map((row) => ({ ...row, weight, updatedAt: Date.now() })))
+    await fieldDb.points.bulkPut(rows.map((row) => ({ ...row, weight, updatedAt: Date.now() })))
+    await recomputeDischarge(verticalSectionId(verticalId))
     return rows.length
+  }
+
+  /** 由垂线 id 反查所属测次（测点变动后联动重算断面流量） */
+  function verticalSectionId(verticalId: string): string {
+    return verticals.value.find((vertical) => vertical.id === verticalId)?.sectionId ?? ''
   }
 
   return {
     sections,
     verticals,
     points,
+    discharges,
     ready,
     error,
     currentSectionId,
@@ -355,6 +420,8 @@ export const useSectionStore = defineStore('section', () => {
     start,
     sectionsOfStation,
     sectionById,
+    dischargeOfSection,
+    isSectionReadyToReport,
     verticalsOfSection,
     pointsOfVertical,
     verticalStats,
@@ -369,6 +436,7 @@ export const useSectionStore = defineStore('section', () => {
     createSection,
     updateSection,
     removeSection,
+    reportDischarge,
     createVertical,
     updateVertical,
     removeVertical,

@@ -4,7 +4,7 @@
  */
 import { liveQuery, type Table } from 'dexie'
 import { onScopeDispose, ref, shallowRef, type Ref } from 'vue'
-import { createId, db } from '@/utils/db'
+import { createId } from '@/utils/db'
 
 /** 所有持久化实体的公共字段 */
 export interface IdbRecord {
@@ -50,14 +50,14 @@ export interface UseIdbTableResult<T extends IdbRecord> {
 }
 
 /**
- * @param tableSelector 从 Dexie 实例取表的函数，例如 (database) => database.stations
+ * @param tableSelector 从指定库实例取表的函数，例如 () => fieldDb.stations
  */
 export function useIdbTable<T extends IdbRecord>(
-  tableSelector: (database: typeof db) => Table<T, string>,
+  tableSelector: () => Table<T, string>,
   options: UseIdbTableOptions<T> = {}
 ): UseIdbTableResult<T> {
   const { sortByUpdatedAt = true, immediate = true, onChange } = options
-  const table = tableSelector(db)
+  const table = tableSelector()
 
   const rows = ref([]) as Ref<T[]>
   const loading = ref(false)

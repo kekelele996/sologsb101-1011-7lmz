@@ -5,7 +5,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Download, Refresh, Upload, Warning } from '@element-plus/icons-vue'
+import { Download, Refresh, RefreshRight, Upload, Warning } from '@element-plus/icons-vue'
 import type { UploadFile } from 'element-plus'
 import StatBadge from '@/components/common/StatBadge.vue'
 import DeviationTag from '@/components/common/DeviationTag.vue'
@@ -14,8 +14,9 @@ import { useRatingStore } from '@/stores/ratingStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import {
-  DB_NAME,
   DB_VERSION,
+  FIELD_DB_NAME,
+  OFFICE_DB_NAME,
   countAll,
   readLastBackupAt,
   readStampedDbVersion,
@@ -48,8 +49,10 @@ const exporting = ref(false)
 
 const compareRows = computed(() => ratingStore.compareRows)
 const overLimitRows = computed(() => ratingStore.overLimitRows)
+const suspendedRows = computed(() => ratingStore.suspendedRatings)
+const failedDeliveries = computed(() => ratingStore.failedDeliveries)
 
-/** 检测结论：按测站汇总测次、最新水位、定线参数与超限点据 */
+/** 检测结论：按测站汇总测次、最新水位、定线参数、挂起与超限点据 */
 const conclusions = ref<
   Array<{
     stationId: string
@@ -58,6 +61,7 @@ const conclusions = ref<
     sectionCount: number
     latestStageM: number | null
     ratingCount: number
+    suspendedCount: number
     overLimitCount: number
     fitText: string
   }>
@@ -135,7 +139,7 @@ async function handleImport(): Promise<void> {
 async function handleReset(): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      '将清空全部本地数据并重新播种演示数据（测站、断面、垂线、测点、点据、比测）。确认继续？',
+      '将清空两侧本地库（外业：测站/测次/垂线/测点/断面成果；整编：点据/比测/结论历史）并重新播种演示数据。确认继续？',
       '重置本地数据',
       { type: 'warning', confirmButtonText: '清空并重建', cancelButtonText: '取消' }
     )
@@ -149,10 +153,21 @@ async function handleReset(): Promise<void> {
 }
 
 async function refreshAll(): Promise<void> {
+  const suspended = await ratingStore.reconcileWithField()
   await ratingStore.rebuildCompares(ratingStore.activeLineNo)
   await refreshCounts()
   await buildConclusions()
-  ElMessage.success('已重新定线并刷新结构版本信息')
+  ElMessage.success(
+    suspended.length > 0
+      ? `已重新定线并对账：${suspended.length} 条点据因外业报出后改动挂起待核`
+      : '已与外业对账、重新定线并刷新结构版本信息'
+  )
+}
+
+async function retryDeliveries(): Promise<void> {
+  const { success, failed } = await ratingStore.retryFailedDeliveries()
+  if (failed === 0) ElMessage.success(`已按整编室侧重试，${success} 版结论送交成功，外业成果未动`)
+  else ElMessage.warning(`成功 ${success} 版，仍有 ${failed} 版失败`)
 }
 
 onMounted(() => {
@@ -172,15 +187,24 @@ onMounted(() => {
         </p>
       </div>
       <div class="page__actions">
-        <el-button :icon="Refresh" @click="refreshAll">重新定线并刷新</el-button>
+        <el-button :icon="Refresh" @click="refreshAll">与外业对账并重算</el-button>
+        <el-button
+          :icon="RefreshRight"
+          type="warning"
+          :disabled="failedDeliveries.length === 0"
+          @click="retryDeliveries"
+        >
+          重试失败送交（{{ failedDeliveries.length }}）
+        </el-button>
         <el-button type="primary" :icon="Download" :loading="exporting" @click="handleExport">导出 JSON</el-button>
       </div>
     </div>
 
     <div class="gb-stats-row">
       <StatBadge label="测站" :value="counts.stations ?? 0" suffix="站" icon="Odometer" />
-      <StatBadge label="断面测次" :value="counts.sections ?? 0" suffix="次" icon="Files" tone="info" />
+      <StatBadge label="断面测次 / 成果" :value="`${counts.sections ?? 0} / ${counts.discharges ?? 0}`" icon="Files" tone="info" />
       <StatBadge label="流速测点" :value="counts.points ?? 0" suffix="点" icon="DataLine" tone="success" />
+      <StatBadge label="挂起待核点据" :value="suspendedRows.length" suffix="点" :tone="suspendedRows.length > 0 ? 'danger' : 'success'" icon="Warning" />
       <StatBadge
         label="比测合格率"
         :value="ratingStore.fitQuality.qualifyRatePct"
@@ -195,7 +219,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>检测结论（按测站）</h3>
         <span class="gb-hint">
-          本地库 {{ DB_NAME }} · 结构版本 v{{ DB_VERSION }}（浏览器记录 v{{ stampedVersion }}）·
+          外业库 {{ FIELD_DB_NAME }} · 整编库 {{ OFFICE_DB_NAME }} · 结构版本 v{{ DB_VERSION }}（浏览器记录 v{{ stampedVersion }}）·
           最近备份 {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </span>
       </div>
@@ -222,7 +246,47 @@ onMounted(() => {
             <span class="gb-mono" :class="{ 'page__danger': row.overLimitCount > 0 }">{{ row.overLimitCount }}</span>
           </template>
         </el-table-column>
+        <el-table-column label="挂起" width="90" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono" :class="{ 'page__danger': row.suspendedCount > 0 }">{{ row.suspendedCount }}</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="fitText" label="定线成果" min-width="320" show-overflow-tooltip />
+      </el-table>
+    </el-card>
+
+    <el-card v-if="suspendedRows.length > 0" shadow="never" class="gb-panel">
+      <div class="gb-panel-title">
+        <h3>
+          挂起点据（等人复核）
+          <el-tag type="danger" size="small" effect="plain">
+            <el-icon><Warning /></el-icon> {{ suspendedRows.length }} 条
+          </el-tag>
+        </h3>
+        <span class="gb-hint">外业报出后又补录 / 修改了垂线测点，引用旧成果版本的点据先挂起，不挡其他点据；请回关系点据页「采用新成果」或「作废」。</span>
+      </div>
+      <el-table :data="suspendedRows" border size="small" class="gb-table-compact">
+        <el-table-column label="测站" min-width="130">
+          <template #default="{ row }">{{ ratingStore.stationNameOf(row.stationId) }}</template>
+        </el-table-column>
+        <el-table-column label="定线号" width="90" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">{{ row.lineNo }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="measureNo" label="测次" min-width="140" />
+        <el-table-column label="水位 (m)" width="100" align="right">
+          <template #default="{ row }">{{ row.stageM.toFixed(2) }}</template>
+        </el-table-column>
+        <el-table-column label="快照流量" width="110" align="right">
+          <template #default="{ row }">{{ row.flowM3s.toFixed(1) }}</template>
+        </el-table-column>
+        <el-table-column label="引用版本" width="100" align="center">
+          <template #default="{ row }">r{{ row.sourceRevision }}</template>
+        </el-table-column>
+        <el-table-column label="最近对账" min-width="160">
+          <template #default="{ row }">{{ new Date(row.checkedAt).toLocaleString('zh-CN') }}</template>
+        </el-table-column>
       </el-table>
     </el-card>
 
@@ -233,14 +297,17 @@ onMounted(() => {
           <el-tag v-if="overLimitRows.length > 0" type="danger" size="small" effect="plain">
             <el-icon><Warning /></el-icon> {{ overLimitRows.length }} 条超限
           </el-tag>
+          <el-tag v-if="failedDeliveries.length > 0" type="warning" size="small" effect="plain">
+            {{ failedDeliveries.length }} 版结论送交失败
+          </el-tag>
         </h3>
-        <span class="gb-hint">偏差 = (曲线流量 − 实测流量) / 实测流量 × 100%，限值 {{ ratingStore.deviationLimitPct }}%</span>
+        <span class="gb-hint">偏差 = (曲线流量 − 实测流量) / 实测流量 × 100%，限值 {{ ratingStore.deviationLimitPct }}%；挂起点据不参与统计</span>
       </div>
 
       <EmptyPanel
         v-if="compareRows.length === 0"
         title="还没有比测记录"
-        description="在关系点据页新增点据并执行「重新定线」后，系统会自动生成比测记录与偏差判定。"
+        description="在关系点据页按外业报出测次落点据并执行「重新定线」后，系统会自动生成当前比测结论，并保留历史版本。"
         compact
       />
 
@@ -278,6 +345,9 @@ onMounted(() => {
           </template>
         </el-table-column>
         <el-table-column prop="compare.operator" label="比测人" width="100" />
+        <el-table-column label="结论版本" width="90" align="center">
+          <template #default="{ row }">v{{ row.compare.conclusionRev }}</template>
+        </el-table-column>
         <el-table-column label="比测日期" min-width="150">
           <template #default="{ row }">
             <span class="gb-mono">{{ new Date(row.compare.comparedAt).toLocaleDateString('zh-CN') }}</span>
@@ -290,7 +360,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容含外业侧 stations / sections / verticals / points / discharges 与整编侧 stationsOffice / ratings / compares / conclusions 共九张表
         </span>
       </div>
 
@@ -323,7 +393,8 @@ onMounted(() => {
       </el-form>
 
       <el-descriptions :column="3" border size="small">
-        <el-descriptions-item label="本地库名">{{ DB_NAME }}</el-descriptions-item>
+        <el-descriptions-item label="外业库名">{{ FIELD_DB_NAME }}</el-descriptions-item>
+        <el-descriptions-item label="整编库名">{{ OFFICE_DB_NAME }}</el-descriptions-item>
         <el-descriptions-item label="结构版本">v{{ DB_VERSION }}</el-descriptions-item>
         <el-descriptions-item label="测站 / 测次">
           {{ counts.stations ?? 0 }} / {{ counts.sections ?? 0 }}
@@ -331,8 +402,14 @@ onMounted(() => {
         <el-descriptions-item label="垂线 / 测点">
           {{ counts.verticals ?? 0 }} / {{ counts.points ?? 0 }}
         </el-descriptions-item>
-        <el-descriptions-item label="点据 / 比测">
-          {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
+        <el-descriptions-item label="断面成果（已报出）">
+          {{ counts.discharges ?? 0 }}
+        </el-descriptions-item>
+        <el-descriptions-item label="点据（正常 / 挂起）">
+          {{ ratingStore.ratings.filter((item) => item.status === '正常').length }} / {{ suspendedRows.length }}
+        </el-descriptions-item>
+        <el-descriptions-item label="当前比测 / 结论版本">
+          {{ counts.compares ?? 0 }} / {{ counts.conclusions ?? 0 }}
         </el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}

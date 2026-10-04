@@ -7,7 +7,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Refresh, Right, Warning } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Promotion, Refresh, Right, Warning } from '@element-plus/icons-vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
@@ -40,6 +40,9 @@ const form = reactive({
 const verticals = computed(() => sectionStore.verticalsOfSection(sectionId.value))
 const conflicts = computed(() => (section.value ? sectionStore.findDistanceConflicts(sectionId.value) : []))
 
+/** 已落库的断面流量成果（外业组持有，垂线测点改动自动重算升版） */
+const savedDischarge = computed(() => (section.value ? sectionStore.dischargeOfSection(section.value.id) : null))
+
 /** 每条垂线的平均流速（按测点权重加权）与单宽流量 */
 const verticalRows = computed(() =>
   verticals.value.map((vertical) => {
@@ -68,6 +71,25 @@ const stats = computed(() => ({
   maxDepthM: verticals.value.length ? Math.max(...verticals.value.map((item) => item.depthM)) : 0,
   widthM: discharge.value.widthM
 }))
+
+async function reportDischarge(): Promise<void> {
+  if (!section.value) return
+  try {
+    await ElMessageBox.confirm(
+      `把测次「${section.value.measureNo}」当前断面流量 ${discharge.value.flowM3s.toFixed(2)} m³/s 报送给整编室？报送只登记在本侧成果上；报送后再改垂线 / 测点，整编室引用该成果的点据会先挂起等人复核。`,
+      '报出断面流量',
+      { type: 'info', confirmButtonText: '报出', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  const reported = await sectionStore.reportDischarge(section.value.id)
+  if (!reported) {
+    ElMessage.warning('尚未算出有效的断面流量，请先布设垂线并录入测点')
+    return
+  }
+  ElMessage.success(`已报出断面流量 ${reported.flowM3s.toFixed(2)} m³/s（成果版本 r${reported.revision}）`)
+}
 
 function nextNo(): number {
   const numbers = verticals.value.map((vertical) => vertical.no)
@@ -211,12 +233,24 @@ onMounted(() => {
             测次 {{ section.measureNo }} · 垂线布设与测深
             <el-tag size="small" effect="plain">{{ section.method }}</el-tag>
             <el-tag size="small" type="info" effect="plain">水位 {{ section.stageM.toFixed(2) }} m</el-tag>
+            <el-tag v-if="savedDischarge?.reported" size="small" type="success" effect="plain">
+              已报出整编室 · r{{ savedDischarge.revision }}
+            </el-tag>
+            <el-tag v-else-if="savedDischarge" size="small" type="warning" effect="plain">
+              外业自存 · r{{ savedDischarge.revision }}（未报出）
+            </el-tag>
           </h2>
           <p class="gb-hint">
-            录入起点距与水深，测点数决定按相对水深自动生成的测点行（1/2/3/5 点法有预设分布）。垂线按起点距升序参与流量计算。
+            录入起点距与水深，测点数决定按相对水深自动生成的测点行（1/2/3/5 点法有预设分布）。垂线按起点距升序参与流量计算；
+            断面流量归外业组持有，改动自动重算，报出后再改会升版本并让整编室引用点据挂起复核。
           </p>
         </div>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增垂线</el-button>
+        <div class="page__head-actions">
+          <el-button type="warning" :icon="Promotion" @click="reportDischarge">
+            {{ savedDischarge?.reported ? '按最新成果重报' : '报出断面流量' }}
+          </el-button>
+          <el-button type="primary" :icon="Plus" @click="openCreate">新增垂线</el-button>
+        </div>
       </div>
 
       <div class="gb-stats-row">
@@ -290,7 +324,13 @@ onMounted(() => {
       <div v-if="verticalRows.length > 0" class="gb-panel">
         <div class="gb-panel-title">
           <h3>部分面积法断面流量成果</h3>
-          <span class="gb-hint">水面宽 {{ discharge.widthM }} m · 断面面积 {{ discharge.areaM2 }} m² · 平均流速 {{ discharge.meanVelocityMs }} m/s</span>
+          <span class="gb-hint">
+            水面宽 {{ discharge.widthM }} m · 断面面积 {{ discharge.areaM2 }} m² · 平均流速 {{ discharge.meanVelocityMs }} m/s
+            <template v-if="savedDischarge">
+              · 已落库版本 r{{ savedDischarge.revision }}
+              （{{ savedDischarge.reported ? `已报出 ${new Date(savedDischarge.reportedAt ?? '').toLocaleString('zh-CN')}` : '外业自存，未报出' }}）
+            </template>
+          </span>
         </div>
         <el-table :data="discharge.slices" border size="small" class="gb-table-compact">
           <el-table-column prop="no" label="垂线号" width="90" align="center" />
@@ -379,6 +419,12 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__head-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .page__warn {

@@ -1,17 +1,36 @@
-/** 水位流量关系点据：参与幂函数定线的实测点 */
+/**
+ * 水位流量关系点据（整编室持有）
+ *
+ * 整编室落点据只认外业组已算出断面流量、且已报出的测次：每条点据带着送交时刻
+ * 外业成果的快照（水位 / 断面流量 / 成果版本）。外业报出后再改垂线或测点，
+ * 快照 revision 对不上外业最新版本，该点据自动转入「挂起」状态等人复核，
+ * 只挡自己一条，不影响同一测次或同一定线号的其他点据。
+ */
+
+/** 点据状态：正常参与定线；挂起等待人工复核（不参与定线） */
+export type RatingStatus = '正常' | '挂起'
+
 export interface Rating {
   id: string
-  /** 所属测站 */
+  /** 所属测站（共享台账 stations.id） */
   stationId: string
-  /** 水位（m） */
+  /** 水位（m）：送交时的测次水位快照 */
   stageM: number
-  /** 流量（m³/s） */
+  /** 断面流量（m³/s）：送交时的外业断面流量快照 */
   flowM3s: number
-  /** 定线号：同一定线号的点据参与同一组拟合 */
+  /** 定线号：同一定线号、状态正常的点据参与同一组拟合 */
   lineNo: string
-  /** 点据来源测次号 */
+  /** 点据来源测次号（冗余留档，便于检索） */
   measureNo: string
-  /** 点据时间 */
+  /** 来源断面测次（外业库 sections.id）；整编室只认已算出断面流量的测次 */
+  sectionId: string
+  /** 送交时外业成果版本，与外业侧 Discharge.revision 对照 */
+  sourceRevision: number
+  /** 正常 / 挂起：源测次报出后外业又改垂线测点时自动置为挂起 */
+  status: RatingStatus
+  /** 最近一次与外业侧对账的时间（ISO） */
+  checkedAt: string
+  /** 点据时间（取测次测流时间） */
   measuredAt: string
   createdAt: number
   updatedAt: number
@@ -46,6 +65,8 @@ export interface RatingFilterState {
   stationIds: string[]
   lineNos: string[]
   verdicts: Array<'合格' | '超限'>
+  /** 点据状态筛选；空数组表示不过滤 */
+  statuses: RatingStatus[]
 }
 
 export function createEmptyRatingFilter(): RatingFilterState {
@@ -53,8 +74,14 @@ export function createEmptyRatingFilter(): RatingFilterState {
     keyword: '',
     stationIds: [],
     lineNos: [],
-    verdicts: []
+    verdicts: [],
+    statuses: []
   }
+}
+
+/** 挂起点据是否参与定线：永不参与，直到人工复核确认 */
+export function isRatingActive(rating: Pick<Rating, 'status'>): boolean {
+  return rating.status === '正常'
 }
 
 /** 对 ln(Q) 与 ln(H - H0) 做最小二乘直线拟合，给定 H0 返回参数与残差 */

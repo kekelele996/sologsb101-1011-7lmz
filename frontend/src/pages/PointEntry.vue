@@ -65,6 +65,9 @@ const discharge = computed(() => {
   return calcSectionDischarge(rows)
 })
 
+/** 已落库的断面流量成果（含成果版本与报出状态） */
+const savedDischarge = computed(() => (section.value ? sectionStore.dischargeOfSection(section.value.id) : null))
+
 /** 本垂线的部分流量 */
 const verticalPartialFlow = computed(() => {
   if (!discharge.value || !vertical.value) return 0
@@ -135,7 +138,7 @@ async function submitForm(): Promise<void> {
 async function removePoint(point: Point): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      `删除相对水深 ${point.relativeDepth} 处的测点？删除后垂线平均流速与断面流量会重新计算。`,
+      `删除相对水深 ${point.relativeDepth} 处的测点？删除后垂线平均流速与本侧断面流量会自动重算（已报出成果将升版本）。`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
     )
@@ -260,6 +263,9 @@ onMounted(() => {
           </h2>
           <p class="gb-hint">
             逐点录入相对水深与流速，权重参与加权平均；同一垂线的平均流速乘以部分面积得到部分流量，最终汇总为断面流量。
+            <el-tag v-if="savedDischarge" size="small" :type="savedDischarge.reported ? 'success' : 'warning'" effect="plain" style="margin-left: 6px">
+              断面流量成果 r{{ savedDischarge.revision }} · {{ savedDischarge.reported ? '已报出整编室' : '外业自存未报出' }}
+            </el-tag>
           </p>
         </div>
         <div class="page__actions">
