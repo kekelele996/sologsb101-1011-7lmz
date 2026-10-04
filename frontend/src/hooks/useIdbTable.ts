@@ -1,10 +1,10 @@
 /**
- * useIdbTable：Dexie 单表增删改查 + 响应式订阅封装。
- * 全部页面统一通过它读写 IndexedDB，避免组件内部直接触碰 Dexie 实例。
+ * useIdbTable：Dexie 单表增删改查 + 响应式订阅封装（数据库无关）。
+ * 双库分权后，页面主要走各 store；此 hook 保留给只读场景按传入表实例使用。
  */
 import { liveQuery, type Table } from 'dexie'
 import { onScopeDispose, ref, shallowRef, type Ref } from 'vue'
-import { createId, db } from '@/utils/db'
+import { createId } from '@/utils/id'
 
 /** 所有持久化实体的公共字段 */
 export interface IdbRecord {
@@ -21,22 +21,17 @@ export type NewRecord<T extends IdbRecord> = Omit<T, 'id' | 'createdAt' | 'updat
 }
 
 export interface UseIdbTableOptions<T extends IdbRecord> {
-  /** 是否按 updatedAt 倒序，默认 true */
   sortByUpdatedAt?: boolean
-  /** 是否在创建 hook 时立即订阅，默认 true */
   immediate?: boolean
-  /** 数据变化后的额外回调 */
   onChange?: (rows: T[]) => void
 }
 
 export interface UseIdbTableResult<T extends IdbRecord> {
   rows: Ref<T[]>
   loading: Ref<boolean>
-  /** 是否已完成首次载入：用于区分「数据为空」与「尚未读取」 */
   ready: Ref<boolean>
   error: Ref<string | null>
   refresh: () => Promise<void>
-  /** 停止 liveQuery 订阅 */
   stop: () => void
   getById: (id: string) => Promise<T | undefined>
   list: () => Promise<T[]>
@@ -50,14 +45,13 @@ export interface UseIdbTableResult<T extends IdbRecord> {
 }
 
 /**
- * @param tableSelector 从 Dexie 实例取表的函数，例如 (database) => database.stations
+ * @param table 任意 Dexie 表实例（外业库或整编室库）
  */
 export function useIdbTable<T extends IdbRecord>(
-  tableSelector: (database: typeof db) => Table<T, string>,
+  table: Table<T, string>,
   options: UseIdbTableOptions<T> = {}
 ): UseIdbTableResult<T> {
   const { sortByUpdatedAt = true, immediate = true, onChange } = options
-  const table = tableSelector(db)
 
   const rows = ref([]) as Ref<T[]>
   const loading = ref(false)

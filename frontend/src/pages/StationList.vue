@@ -6,20 +6,20 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Cpu, Delete, Edit, Plus, Right, Warning } from '@element-plus/icons-vue'
+import { Cpu, Delete, Edit, Plus, Right } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
-import { useRatingStore } from '@/stores/ratingStore'
-import { CATCHMENT_BUCKETS, createEmptyStationFilter, type Station } from '@/types/station'
-import { initDatabase } from '@/utils/db'
+import { useSectionStore } from '@/stores/sectionStore'
+import { CATCHMENT_BUCKETS, type Station } from '@/types/station'
+import { bootstrap } from '@/utils/bootstrap'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
-const ratingStore = useRatingStore()
+const sectionStore = useSectionStore()
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -49,13 +49,17 @@ const catchmentBucket = ref<string>('all')
 const stationCards = computed(() =>
   stationStore.filteredStations.map((station) => {
     const stats = stationStore.sectionStats[station.id] ?? { count: 0, latestStageM: null, latestMeasuredAt: null }
-    const ratings = ratingStore.ratings.filter((rating) => rating.stationId === station.id)
-    const ratingIds = new Set(ratings.map((rating) => rating.id))
-    const compares = ratingStore.compares.filter((compare) => ratingIds.has(compare.ratingId))
-    const overLimit = compares.filter((compare) => compare.verdict === '超限').length
-    const qualifyRate =
-      compares.length === 0 ? 0 : Number((((compares.length - overLimit) / compares.length) * 100).toFixed(0))
-    return { station, stats, ratingCount: ratings.length, overLimit, qualifyRate }
+    const stationSections = sectionStore.sectionsOfStation(station.id)
+    const reported = stationSections.filter((s) => s.reported)
+    const pending = stationSections.filter((s) => !s.reported)
+    return {
+      station,
+      stats,
+      reportedCount: reported.length,
+      pendingCount: pending.length,
+      latestFlow: reported.sort((a, b) => Date.parse(b.reportedAt ?? '') - Date.parse(a.reportedAt ?? ''))[0]
+        ?.reportedFlowM3s ?? null
+    }
   })
 )
 
@@ -160,7 +164,7 @@ async function submitForm(): Promise<void> {
 async function removeStation(station: Station): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      `删除测站「${station.name}」将同时删除其断面测次、垂线、流速测点、关系点据与比测记录，确认删除？`,
+      `删除测站「${station.name}」将同时删除其外业断面测次、垂线与流速测点（整编室点据由整编室另行处理），确认删除？`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
     )
@@ -177,8 +181,8 @@ function gotoSections(station: Station): void {
 }
 
 async function reseed(): Promise<void> {
-  await initDatabase()
-  ElMessage.success('已按需补齐演示数据（幂等播种）')
+  await bootstrap()
+  ElMessage.success('已就绪（外业库 / 整编室库）')
 }
 
 onMounted(() => {
@@ -225,7 +229,7 @@ watch(
         </div>
       </template>
       <template #actions>
-        <el-button size="small" :icon="Cpu" @click="reseed">补齐演示数据</el-button>
+        <el-button size="small" :icon="Cpu" @click="reseed">检查双库</el-button>
       </template>
     </FilterBar>
 
@@ -246,11 +250,11 @@ watch(
         icon="Files"
       />
       <StatBadge
-        label="超限比测"
-        :value="ratingStore.overLimitRows.length"
-        suffix="条"
-        :tone="ratingStore.overLimitRows.length > 0 ? 'danger' : 'success'"
-        :icon="ratingStore.overLimitRows.length > 0 ? 'WarningFilled' : 'DataLine'"
+        label="已报出测次"
+        :value="stationStore.sections.filter((s) => s.reported).length"
+        suffix="次"
+        tone="warning"
+        icon="Promotion"
       />
     </div>
 
@@ -291,21 +295,20 @@ watch(
             icon="Odometer"
           />
           <StatBadge
-            label="比测合格率"
-            :value="card.qualifyRate"
-            suffix="%"
+            label="已报出"
+            :value="card.reportedCount"
+            suffix="次"
             size="small"
-            :percent="card.qualifyRate"
-            :tone="card.overLimit > 0 ? 'warning' : 'success'"
-            :icon="card.overLimit > 0 ? 'WarningFilled' : 'DataLine'"
+            tone="success"
+            icon="Promotion"
           />
         </div>
 
         <div class="station-card__meta">
           <span>集水面积 <b class="gb-mono">{{ card.station.catchmentKm2 }}</b> km²</span>
-          <span>关系点据 <b class="gb-mono">{{ card.ratingCount }}</b> 个</span>
-          <span v-if="card.overLimit > 0" class="station-card__alert">
-            <el-icon><Warning /></el-icon> 超限 <b class="gb-mono">{{ card.overLimit }}</b> 条
+          <span>已报出断面流量 <b class="gb-mono">{{ card.reportedCount }}</b> 次</span>
+          <span v-if="card.pendingCount > 0" class="station-card__pending">
+            待补录/待报出 <b class="gb-mono">{{ card.pendingCount }}</b> 次
           </span>
         </div>
 
@@ -458,6 +461,10 @@ watch(
   align-items: center;
   gap: 4px;
   color: #c0392b;
+}
+
+.station-card__pending {
+  color: #b8860b;
 }
 
 .station-card__remark {

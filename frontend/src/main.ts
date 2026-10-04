@@ -6,7 +6,7 @@ import 'element-plus/dist/index.css'
 import * as ElementPlusIconsVue from '@element-plus/icons-vue'
 import App from '@/App.vue'
 import router from '@/router'
-import { initDatabase } from '@/utils/db'
+import { bootstrap } from '@/utils/bootstrap'
 import '@/styles/main.css'
 
 const app = createApp(App)
@@ -21,6 +21,6 @@ app.use(ElementPlus, { locale: zhCn })
 
 app.mount('#app')
 
-// 首屏打开数据库并幂等播种演示数据（测站 → 断面 → 垂线 → 测点 → 点据 → 比测），
-// 播种完成后 store 的 liveQuery 订阅会自动把数据推到页面。
-void initDatabase()
+// 首屏启用双库分权：旧单库先迁移到外业库/整编室库两边再启用；
+// 全新环境则播种双库演示数据。完成后 store 的 liveQuery 自动推送到页面。
+void bootstrap()

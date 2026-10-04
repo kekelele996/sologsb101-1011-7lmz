@@ -1,10 +1,11 @@
 /**
- * 测站 store：维护测站列表、当前选中测站与测站台账筛选条件。
- * 数据经 utils/db.ts 的 Dexie 表订阅实时刷新，页面只读消费。
+ * 外业 · 测站 store：维护外业库测站列表、当前选中测站与筛选条件。
+ * 测站是外业属主；新建/编辑后向整编室发 station-sync 档案同步。
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { db, createId, readLastStationId, watchTable, writeLastStationId } from '@/utils/db'
+import { fieldDb, createId, watchTable, readLastStationId, writeLastStationId } from '@/utils/fieldDb'
+import { syncStation } from '@/utils/fieldService'
 import type { Station } from '@/types/station'
 import type { Section } from '@/types/section'
 import { createEmptyStationFilter, type StationFilterState } from '@/types/station'
@@ -19,11 +20,10 @@ export const useStationStore = defineStore('station', () => {
 
   let started = false
 
-  /** 启动 IndexedDB 实时订阅（幂等） */
   function start(): void {
     if (started) return
     started = true
-    watchTable<Station>(() => db.stations).subscribe((rows) => {
+    watchTable<Station>(() => fieldDb.stations).subscribe((rows) => {
       stations.value = rows
       ready.value = true
       error.value = null
@@ -31,7 +31,7 @@ export const useStationStore = defineStore('station', () => {
         selectStation(rows[0].id)
       }
     })
-    watchTable<Section>(() => db.sections).subscribe((rows) => {
+    watchTable<Section>(() => fieldDb.sections).subscribe((rows) => {
       sections.value = rows
     })
   }
@@ -40,12 +40,10 @@ export const useStationStore = defineStore('station', () => {
     () => stations.value.find((station) => station.id === currentStationId.value) ?? null
   )
 
-  /** 全部可选河名（筛选下拉与表单联想共用） */
   const riverOptions = computed<string[]>(() =>
     Array.from(new Set(stations.value.map((station) => station.river))).sort((a, b) => a.localeCompare(b))
   )
 
-  /** 测站 id → 测次数量、最新水位与最新测次时间 */
   const sectionStats = computed<
     Record<string, { count: number; latestStageM: number | null; latestMeasuredAt: string | null }>
   >(() => {
@@ -64,7 +62,6 @@ export const useStationStore = defineStore('station', () => {
     return stats
   })
 
-  /** 按筛选条件过滤后的测站 */
   const filteredStations = computed<Station[]>(() =>
     stations.value.filter((station) => {
       const keyword = filter.value.keyword.trim()
@@ -87,7 +84,6 @@ export const useStationStore = defineStore('station', () => {
       filter.value.maxCatchmentKm2 !== null
   )
 
-  /** 合计集水面积（km²） */
   const totalCatchmentKm2 = computed<number>(() =>
     Number(filteredStations.value.reduce((sum, station) => sum + station.catchmentKm2, 0).toFixed(1))
   )
@@ -113,38 +109,36 @@ export const useStationStore = defineStore('station', () => {
   async function createStation(payload: Omit<Station, 'id' | 'createdAt' | 'updatedAt'>): Promise<Station> {
     const now = Date.now()
     const row: Station = { ...payload, id: createId('stn'), createdAt: now, updatedAt: now }
-    await db.stations.put(row)
+    await fieldDb.stations.put(row)
+    await syncStation(row)
     return row
   }
 
   async function updateStation(id: string, patch: Partial<Station>): Promise<void> {
-    await db.stations.update(id, { ...patch, updatedAt: Date.now() } as never)
+    const now = Date.now()
+    await fieldDb.stations.update(id, { ...patch, updatedAt: now } as never)
+    const row = await fieldDb.stations.get(id)
+    if (row) await syncStation(row)
   }
 
-  /** 删除测站：级联删除其断面、垂线、测点、点据与比测记录 */
+  /** 删除测站：仅级联删除外业库的测次/垂线/测点（整编室点据归整编室，不在此删） */
   async function removeStation(id: string): Promise<void> {
-    await db.transaction(
+    await fieldDb.transaction(
       'rw',
-      [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+      [fieldDb.stations, fieldDb.sections, fieldDb.verticals, fieldDb.points],
       async () => {
-        const sectionIds = (await db.sections.where('stationId').equals(id).toArray()).map((row) => row.id)
-        const verticalIds =
-          sectionIds.length > 0
-            ? (await db.verticals.where('sectionId').anyOf(sectionIds).toArray()).map((row) => row.id)
-            : []
-        if (verticalIds.length > 0) {
-          await db.points.where('verticalId').anyOf(verticalIds).delete()
-        }
+        const sectionIds = (await fieldDb.sections.where('stationId').equals(id).toArray()).map((row) => row.id)
         if (sectionIds.length > 0) {
-          await db.verticals.where('sectionId').anyOf(sectionIds).delete()
-          await db.sections.where('stationId').equals(id).delete()
+          const verticalIds = (await fieldDb.verticals.where('sectionId').anyOf(sectionIds).toArray()).map(
+            (row) => row.id
+          )
+          if (verticalIds.length > 0) {
+            await fieldDb.points.where('verticalId').anyOf(verticalIds).delete()
+          }
+          await fieldDb.verticals.where('sectionId').anyOf(sectionIds).delete()
+          await fieldDb.sections.where('stationId').equals(id).delete()
         }
-        const ratingIds = (await db.ratings.where('stationId').equals(id).toArray()).map((row) => row.id)
-        if (ratingIds.length > 0) {
-          await db.compares.where('ratingId').anyOf(ratingIds).delete()
-          await db.ratings.where('stationId').equals(id).delete()
-        }
-        await db.stations.delete(id)
+        await fieldDb.stations.delete(id)
       }
     )
     if (currentStationId.value === id) selectStation(null)

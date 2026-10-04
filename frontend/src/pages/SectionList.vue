@@ -6,7 +6,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Right, Timer } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Promotion, Right, Timer } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
@@ -15,7 +15,7 @@ import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
-import { initDatabase } from '@/utils/db'
+import { bootstrap } from '@/utils/bootstrap'
 
 const route = useRoute()
 const router = useRouter()
@@ -155,6 +155,20 @@ function gotoVerticals(section: Section): void {
   void router.push(`/sections/${section.id}/verticals`)
 }
 
+/** 报出断面流量：只有已算出成果的测次才能报出，报出后送整编室落点据 */
+const reporting = ref(false)
+async function reportFlow(section: Section): Promise<void> {
+  reporting.value = true
+  try {
+    const result = await sectionStore.report(section.id)
+    ElMessage.success(`测次 ${section.measureNo} 已报出断面流量 ${result.flowM3s.toFixed(2)} m³/s（v${result.revision}）`)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '报出失败')
+  } finally {
+    reporting.value = false
+  }
+}
+
 function handleFilterChange(): void {
   void router.replace({
     query: {
@@ -171,7 +185,7 @@ function handleReset(): void {
 }
 
 function reseedIfEmpty(): void {
-  if (stationStore.stations.length === 0) void initDatabase()
+  if (stationStore.stations.length === 0) void bootstrap()
 }
 
 onMounted(() => {
@@ -298,14 +312,32 @@ onMounted(() => {
             </el-button>
           </template>
         </el-table-column>
+        <el-table-column label="报出状态" width="190" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.reported" type="success" size="small" effect="plain">
+              已报出 v{{ row.reportedRevision }} · {{ (row.reportedFlowM3s ?? 0).toFixed(1) }} m³/s
+            </el-tag>
+            <el-tag v-else type="info" size="small" effect="plain">未报出</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="测流时间" min-width="170">
           <template #default="{ row }">
             <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoVerticals(row)">垂线</el-button>
+            <el-button
+              size="small"
+              :type="row.reported ? 'warning' : 'success'"
+              plain
+              :icon="Promotion"
+              :loading="reporting"
+              @click="reportFlow(row)"
+            >
+              {{ row.reported ? '重新报出' : '报出成果' }}
+            </el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeSection(row)">删除</el-button>
           </template>
@@ -317,7 +349,7 @@ onMounted(() => {
 
       <p class="gb-hint">
         <el-icon><Timer /></el-icon>
-        提示：测次的水位将参与水位流量关系点据定线；同一测次下的垂线按起点距升序参与部分面积法流量计算。
+        提示：补齐垂线与测点算出断面流量后点「报出成果」，整编室才能据此落点据；报出后再改垂线或测点，整编室落在点据上的那条会自动挂起等人复核，不影响其他点据。
       </p>
     </template>
 

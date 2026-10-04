@@ -16,7 +16,7 @@ import { useSectionStore } from '@/stores/sectionStore'
 import { parsePointPaste } from '@/types/point'
 import type { Point } from '@/types/point'
 import { calcMeanVelocity, calcSectionDischarge, velocityFromRevolutions } from '@/utils/flow'
-import { initDatabase } from '@/utils/db'
+import { bootstrap } from '@/utils/bootstrap'
 
 const route = useRoute()
 const router = useRouter()
@@ -214,7 +214,7 @@ function fillByRevolutions(): void {
 }
 
 onMounted(() => {
-  if (stationStore.stations.length === 0) void initDatabase()
+  if (stationStore.stations.length === 0) void bootstrap()
   sectionStore.selectVertical(verticalId.value)
 })
 </script>

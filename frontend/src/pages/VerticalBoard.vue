@@ -7,7 +7,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Refresh, Right, Warning } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Promotion, Refresh, Right, Warning } from '@element-plus/icons-vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
@@ -15,7 +15,7 @@ import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { buildRelativeDepths, type Vertical } from '@/types/vertical'
 import { calcMeanVelocity, calcSectionDischarge } from '@/utils/flow'
-import { initDatabase } from '@/utils/db'
+import { bootstrap } from '@/utils/bootstrap'
 
 const route = useRoute()
 const router = useRouter()
@@ -170,8 +170,22 @@ function gotoPoints(vertical: Vertical): void {
   void router.push(`/verticals/${vertical.id}/points`)
 }
 
+const reporting = ref(false)
+async function reportFlow(): Promise<void> {
+  if (!section.value) return
+  reporting.value = true
+  try {
+    const result = await sectionStore.report(section.value.id)
+    ElMessage.success(`已报出断面流量 ${result.flowM3s.toFixed(2)} m³/s（v${result.revision}），整编室可据此落点据`)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '报出失败')
+  } finally {
+    reporting.value = false
+  }
+}
+
 onMounted(() => {
-  if (stationStore.stations.length === 0) void initDatabase()
+  if (stationStore.stations.length === 0) void bootstrap()
   sectionStore.selectSection(sectionId.value)
 })
 </script>
@@ -216,8 +230,31 @@ onMounted(() => {
             录入起点距与水深，测点数决定按相对水深自动生成的测点行（1/2/3/5 点法有预设分布）。垂线按起点距升序参与流量计算。
           </p>
         </div>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增垂线</el-button>
+        <div class="page__head-actions">
+          <el-button
+            :type="section.reported ? 'warning' : 'success'"
+            plain
+            :icon="Promotion"
+            :loading="reporting"
+            @click="reportFlow"
+          >
+            {{ section.reported ? `重新报出（已报 ${section.reportedFlowM3s?.toFixed(1) ?? ''} m³/s）` : '报出断面流量' }}
+          </el-button>
+          <el-button type="primary" :icon="Plus" @click="openCreate">新增垂线</el-button>
+        </div>
       </div>
+
+      <el-alert
+        v-if="section.reported"
+        :type="section.revision > section.reportedRevision ? 'warning' : 'success'"
+        show-icon
+        :closable="false"
+        :title="
+          section.revision > section.reportedRevision
+            ? `该测次已报出（v${section.reportedRevision}），但报出后又改动了数据（当前 v${section.revision}）：整编室落在点据上的那条已挂起等人复核，可在补录完成后点「重新报出」。`
+            : `该测次已报出断面流量（v${section.reportedRevision}，${section.reportedFlowM3s?.toFixed(2) ?? ''} m³/s），整编室可据此落点据。`
+        "
+      />
 
       <div class="gb-stats-row">
         <StatBadge label="垂线条数" :value="stats.verticalCount" suffix="条" icon="Histogram" />
@@ -363,6 +400,11 @@ onMounted(() => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+}
+
+.page__head-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .page__title {

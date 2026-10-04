@@ -1,15 +1,30 @@
 <script setup lang="ts">
 /**
- * 应用外壳：顶部导航（路由跳转 + 数据概览）、主内容区与页脚。
- * 导航项在层级路由下回落到父级列表，保证任意深链页面都能一键跳走。
+ * 应用外壳：按岗位切换两套导航——
+ * 外业组（测站/测次/垂线/测点/成果备份）与整编室（关系点据定线/比测结论档案）。
+ * 两边各自持有自己的库，导航徽标分别统计。
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import {
+  DataLine,
+  Files,
+  FolderOpened,
+  Histogram,
+  Odometer,
+  PieChart,
+  Promotion,
+  TrendCharts
+} from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
-import { DB_NAME, DB_VERSION } from '@/utils/db'
+import { FIELD_DB_NAME, FIELD_DB_VERSION } from '@/utils/fieldDb'
+import { OFFICE_DB_NAME, OFFICE_DB_VERSION } from '@/utils/officeDb'
+import { bootstrap } from '@/utils/bootstrap'
+import { flushSide } from '@/utils/transport'
+import { applyOfficeInbox } from '@/utils/officeMessages'
+import { applyFieldInbox } from '@/utils/fieldMessages'
 
 const route = useRoute()
 const router = useRouter()
@@ -17,50 +32,86 @@ const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
 
-onMounted(() => {
+onMounted(async () => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  await bootstrap()
+  // 每次回到应用都尝试把积压消息投递、入账（幂等）
+  await flushSide('field')
+  await flushSide('office')
+  await applyOfficeInbox()
+  await applyFieldInbox()
 })
 
-/** 层级路由统一归属到最上层导航项 */
+/** 当前岗位（路由 meta.side 决定） */
+const side = computed<'field' | 'office'>(() =>
+  route.meta.side === 'office' ? 'office' : 'field'
+)
+
+const fieldNav = computed(() => [
+  { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
+  { key: '/field/export', label: '外业成果 / 备份', icon: FolderOpened, badge: '' }
+])
+
+const officeNav = computed(() => [
+  {
+    key: '/office/ratings',
+    label: '关系点据与定线',
+    icon: TrendCharts,
+    badge: String(ratingStore.ratingPoints.filter((p) => p.status === 'active' || p.status === 'resolved').length)
+  },
+  {
+    key: '/office/archive',
+    label: '比测结论档案',
+    icon: PieChart,
+    badge: ratingStore.failedDispatchCount > 0 ? String(ratingStore.failedDispatchCount) : ''
+  }
+])
+
+const navItems = computed(() => (side.value === 'field' ? fieldNav.value : officeNav.value))
+
 const activeKey = computed(() => {
   if (route.path.startsWith('/stations/')) return '/stations'
   if (route.path.startsWith('/sections/')) return '/stations'
   if (route.path.startsWith('/verticals/')) return '/stations'
+  if (route.path.startsWith('/stations')) return '/stations'
+  if (route.path.startsWith('/office/archive')) return '/office/archive'
+  if (route.path.startsWith('/office/ratings')) return '/office/ratings'
+  if (route.path.startsWith('/field/export')) return '/field/export'
   return route.path
 })
 
-const navItems = computed(() => [
-  { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
-  { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
-  { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
-])
-
-/** 当前上下文的快捷入口：选中测站 → 断面，选中断面 → 垂线，选中垂线 → 测点 */
+/** 层级页面的上下文快捷入口 */
 const contextLinks = computed(() => {
   const links: Array<{ label: string; path: string }> = []
-  const stationId = route.params.id as string | undefined
-  if (route.path.startsWith('/stations/') && stationId) {
-    links.push({ label: '该站断面测次', path: `/stations/${stationId}/sections` })
+  const id = route.params.id as string | undefined
+  if (side.value !== 'field') return links
+  if (route.path.startsWith('/stations/') && id) {
+    links.push({ label: '该站断面测次', path: `/stations/${id}/sections` })
   }
-  if (route.path.startsWith('/sections/') && stationId) {
-    const section = sectionStore.sectionById(stationId)
+  if (route.path.startsWith('/sections/') && id) {
+    const section = sectionStore.sectionById(id)
     if (section) links.push({ label: '所属测站断面', path: `/stations/${section.stationId}/sections` })
-    links.push({ label: '该断面垂线', path: `/sections/${stationId}/verticals` })
+    links.push({ label: '该断面垂线', path: `/sections/${id}/verticals` })
   }
-  if (route.path.startsWith('/verticals/') && stationId) {
-    const vertical = sectionStore.verticals.find((item) => item.id === stationId)
+  if (route.path.startsWith('/verticals/') && id) {
+    const vertical = sectionStore.verticals.find((item) => item.id === id)
     if (vertical) links.push({ label: '所属断面垂线', path: `/sections/${vertical.sectionId}/verticals` })
   }
-  if (route.path.startsWith('/ratings')) links.push({ label: '比测分析', path: '/export' })
-  if (route.path.startsWith('/export')) links.push({ label: '关系点据', path: '/ratings' })
   return links
 })
 
 function go(path: string): void {
   void router.push(path)
 }
+
+function switchSide(target: 'field' | 'office'): void {
+  if (target === side.value) return
+  void router.push(target === 'field' ? '/stations' : '/office/ratings')
+}
+
+const heldCount = computed(() => ratingStore.heldPoints.length)
 </script>
 
 <template>
@@ -70,35 +121,52 @@ function go(path: string): void {
         <span class="app-header__mark">水</span>
         <div>
           <h1 class="app-header__title">水文站流量测验与绳套曲线台</h1>
-          <p class="app-header__sub">测站 · 断面测次 · 垂线测深 · 流速测点 · 水位流量关系定线 · 比测偏差</p>
+          <p class="app-header__sub">
+            {{ side === 'field' ? '外业组：测次 · 垂线测深 · 流速测点 · 断面流量报出' : '整编室：定线号 · 关系点据 · 比测结论' }}
+          </p>
         </div>
       </div>
-      <nav class="app-nav">
-        <button
-          v-for="item in navItems"
-          :key="item.key"
-          class="app-nav__item"
-          :class="{ 'is-active': activeKey === item.key }"
-          type="button"
-          @click="go(item.key)"
-        >
-          <el-icon><component :is="item.icon" /></el-icon>
-          <span>{{ item.label }}</span>
-          <em v-if="item.badge" class="app-nav__badge">{{ item.badge }}</em>
-        </button>
-      </nav>
+
+      <div class="app-header__right">
+        <div class="app-side-switch">
+          <button
+            type="button"
+            class="app-side-switch__btn"
+            :class="{ 'is-active': side === 'field' }"
+            @click="switchSide('field')"
+          >
+            <el-icon><DataLine /></el-icon> 外业组
+          </button>
+          <button
+            type="button"
+            class="app-side-switch__btn"
+            :class="{ 'is-active': side === 'office' }"
+            @click="switchSide('office')"
+          >
+            <el-icon><Promotion /></el-icon> 整编室
+            <em v-if="heldCount > 0" class="app-side-switch__dot" :title="`${heldCount} 条点据挂起待复核`" />
+          </button>
+        </div>
+        <nav class="app-nav">
+          <button
+            v-for="item in navItems"
+            :key="item.key"
+            class="app-nav__item"
+            :class="{ 'is-active': activeKey === item.key }"
+            type="button"
+            @click="go(item.key)"
+          >
+            <el-icon><component :is="item.icon" /></el-icon>
+            <span>{{ item.label }}</span>
+            <em v-if="item.badge" class="app-nav__badge">{{ item.badge }}</em>
+          </button>
+        </nav>
+      </div>
     </header>
 
     <div v-if="contextLinks.length > 0" class="app-context">
       <span class="app-context__label">当前上下文：</span>
-      <el-button
-        v-for="link in contextLinks"
-        :key="link.path"
-        size="small"
-        text
-        type="primary"
-        @click="go(link.path)"
-      >
+      <el-button v-for="link in contextLinks" :key="link.path" size="small" text type="primary" @click="go(link.path)">
         {{ link.label }}
       </el-button>
     </div>
@@ -111,12 +179,16 @@ function go(path: string): void {
 
     <footer class="app-footer">
       <span>
-        本地库 {{ DB_NAME }} · 结构版本 v{{ DB_VERSION }} · 数据仅存于本浏览器 IndexedDB，不上传任何服务器。
+        外业库 {{ FIELD_DB_NAME }} v{{ FIELD_DB_VERSION }} · 整编室库 {{ OFFICE_DB_NAME }} v{{ OFFICE_DB_VERSION }}
+        · 数据仅存于本浏览器 IndexedDB，两边各自持有。
       </span>
-      <span>
+      <span v-if="side === 'field'">
         测站 {{ stationStore.stations.length }} · 测次 {{ sectionStore.sections.length }} · 垂线
-        {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }} · 点据
-        {{ ratingStore.ratings.length }}
+        {{ sectionStore.verticals.length }} · 测点 {{ sectionStore.points.length }}
+      </span>
+      <span v-else>
+        点据 {{ ratingStore.ratingPoints.length }}（挂起 {{ heldCount }}）· 报出成果
+        {{ ratingStore.reports.length }} · 结论批次 {{ ratingStore.compareRuns.length }}
       </span>
     </footer>
   </div>
@@ -169,6 +241,49 @@ function go(path: string): void {
   font-size: 12px;
   letter-spacing: 1px;
   color: rgba(234, 246, 251, 0.75);
+}
+
+.app-header__right {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+}
+
+.app-side-switch {
+  display: inline-flex;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 999px;
+  padding: 2px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.app-side-switch__btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: #eaf6fb;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.app-side-switch__btn.is-active {
+  background: #eaf6fb;
+  color: #0f4c75;
+  font-weight: 600;
+}
+
+.app-side-switch__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e6a23c;
+  border: 1px solid #fff;
 }
 
 .app-nav {

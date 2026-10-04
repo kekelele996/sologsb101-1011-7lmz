@@ -1,101 +1,145 @@
 /**
- * 定线 store：维护水位流量关系点据、比测记录、定线参数与残差派生值。
- * 供关系点据页（/ratings）与导出页（/export）共用。
+ * 整编室 · 定线 store：关系点据、定线号台账、比测结论批次（均在整编室库）。
+ *
+ * 分权规则：
+ *  - 点据只能由外业报出成果落入（createPointFromReport），不能凭空录入；
+ *  - 报出后外业改动 → 相关点据 held 挂起（不参与定线、不挡别的），人工复核后 resolve/reject；
+ *  - 重新定线追加 compareRuns（旧批次留存可查），并送交外业；
+ *  - 送交失败只由整编室在本侧重试，外业那份不动。
  */
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { db, createId, watchTable } from '@/utils/db'
-import type { Compare } from '@/types/compare'
-import { DEVIATION_LIMIT_PCT, calcDeviationPct, judgeDeviation, type CompareRow } from '@/types/compare'
-import type { Rating, RatingFitResult } from '@/types/rating'
-import { createEmptyRatingFilter, curveFlow, fitPowerCurve, type RatingFilterState } from '@/types/rating'
+import { officeDb, watchTable } from '@/utils/officeDb'
+import {
+  availableReports,
+  createPointFromReport,
+  dispatchConclusion,
+  ensureLine,
+  fittingPoints,
+  movePointLine,
+  refitLine,
+  removePoint,
+  reviewPoint,
+  syncAllRunDispatchStates,
+  updatePoint
+} from '@/utils/officeService'
+import { applyOfficeInbox } from '@/utils/officeMessages'
+import { retrySide } from '@/utils/transport'
+import type { CompareRun, InReport, RatingLine, RatingPoint } from '@/types/office'
+import type { RatingFitResult } from '@/types/rating'
+import { curveFlow, fitPowerCurve } from '@/types/rating'
+import { DEVIATION_LIMIT_PCT } from '@/types/compare'
 import type { Station } from '@/types/station'
+import { createEmptyRatingFilter, type RatingFilterState } from '@/types/rating'
+
+export interface ReportOption extends InReport {
+  used: boolean
+}
 
 export const useRatingStore = defineStore('rating', () => {
-  const ratings = ref<Rating[]>([])
-  const compares = ref<Compare[]>([])
   const stations = ref<Station[]>([])
+  const reports = ref<InReport[]>([])
+  const ratingPoints = ref<RatingPoint[]>([])
+  const ratingLines = ref<RatingLine[]>([])
+  const compareRuns = ref<CompareRun[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
   const filter = ref<RatingFilterState>(createEmptyRatingFilter())
-  /** 当前定线号与定线参数（跨页保留） */
   const activeLineNo = ref<string>('A')
-  const fits = ref<RatingFitResult[]>([])
   const deviationLimitPct = ref<number>(DEVIATION_LIMIT_PCT)
+  const operator = ref<string>('林昭')
 
   let started = false
 
   function start(): void {
     if (started) return
     started = true
-    watchTable<Rating>(() => db.ratings).subscribe((rows) => {
-      ratings.value = rows
-      ready.value = true
-      error.value = null
-    })
-    watchTable<Compare>(() => db.compares).subscribe((rows) => {
-      compares.value = rows
-    })
-    watchTable<Station>(() => db.stations).subscribe((rows) => {
+    watchTable<Station>(() => officeDb.stations).subscribe((rows) => {
       stations.value = rows
+      ready.value = true
+    })
+    watchTable<InReport>(() => officeDb.inReports).subscribe((rows) => {
+      reports.value = rows
+    })
+    watchTable<RatingPoint>(() => officeDb.ratingPoints).subscribe((rows) => {
+      ratingPoints.value = rows
+    })
+    watchTable<RatingLine>(() => officeDb.ratingLines).subscribe((rows) => {
+      ratingLines.value = rows
+    })
+    watchTable<CompareRun>(() => officeDb.compareRuns).subscribe((rows) => {
+      compareRuns.value = rows
     })
   }
 
-  const lineNos = computed<string[]>(() => {
-    const set = new Set<string>()
-    ratings.value.forEach((rating) => set.add(rating.lineNo))
-    return Array.from(set).sort((a, b) => a.localeCompare(b))
-  })
+  /** 拉取新到消息（外业报出/改动）并入账 */
+  async function refreshInbox(): Promise<{ reports: number; held: number }> {
+    const result = await applyOfficeInbox()
+    return { reports: result.reports, held: result.held }
+  }
 
   const stationNameOf = (stationId: string): string =>
     stations.value.find((station) => station.id === stationId)?.name ?? '未知测站'
 
-  /** 逐定线号的拟合结果（幂函数定线） */
-  const allFits = computed<RatingFitResult[]>(() =>
-    lineNos.value.map((lineNo) => {
-      const points = ratings.value
-        .filter((rating) => rating.lineNo === lineNo)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
-      return fitPowerCurve(points, lineNo)
+  /** 定线号集合：以点据里出现过的线号为准，并补台账 */
+  const lineNos = computed<string[]>(() => {
+    const set = new Set<string>()
+    ratingPoints.value.forEach((p) => set.add(p.lineNo))
+    ratingLines.value.forEach((l) => set.add(l.lineNo))
+    return Array.from(set).sort((a, b) => a.localeCompare(b))
+  })
+
+  /** 当前线全部点据（含非在案） */
+  const pointsOfActiveLine = computed<RatingPoint[]>(() =>
+    ratingPoints.value
+      .filter((p) => p.lineNo === activeLineNo.value)
+      .sort((a, b) => a.stageM - b.stageM)
+  )
+
+  /** 当前线可参与定线的点据 */
+  const fittingPointsOfActiveLine = computed<RatingPoint[]>(() =>
+    pointsOfActiveLine.value.filter((p) => p.status === 'active' || p.status === 'resolved')
+  )
+
+  const heldPoints = computed<RatingPoint[]>(() =>
+    ratingPoints.value.filter((p) => p.status === 'held')
+  )
+
+  /** 当前定线实时拟合（只取在案点据） */
+  const activeFit = computed<RatingFitResult>(() =>
+    fitPowerCurve(
+      fittingPointsOfActiveLine.value.map((p) => ({ stageM: p.stageM, flowM3s: p.flowM3s })),
+      activeLineNo.value
+    )
+  )
+
+  /** 点据行：含曲线流量、残差、挂起标记 */
+  const pointRows = computed(() =>
+    pointsOfActiveLine.value.map((point) => {
+      const fit = activeFit.value
+      const predicted = fit.valid ? curveFlow(fit, point.stageM) : 0
+      const residualPct =
+        fit.valid && point.flowM3s > 0
+          ? Number((((point.flowM3s - predicted) / point.flowM3s) * 100).toFixed(2))
+          : 0
+      const verdict = Math.abs(residualPct) > deviationLimitPct.value ? '超限' : '合格'
+      return { point, predicted, residualPct, verdict }
     })
   )
 
-  const activeFit = computed<RatingFitResult>(() => {
-    const cached = fits.value.find((fit) => fit.lineNo === activeLineNo.value)
-    if (cached) return cached
-    const computedFit = allFits.value.find((fit) => fit.lineNo === activeLineNo.value)
-    if (computedFit) return computedFit
-    return fitPowerCurve([], activeLineNo.value)
-  })
-
-  /** 点据 + 曲线流量 + 残差 */
-  const pointRows = computed(() =>
-    ratings.value
-      .filter((rating) => rating.lineNo === activeLineNo.value)
-      .sort((a, b) => a.stageM - b.stageM)
-      .map((rating) => {
-        const predicted = activeFit.value.valid ? curveFlow(activeFit.value, rating.stageM) : 0
-        const residualPct =
-          activeFit.value.valid && rating.flowM3s > 0
-            ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
-            : 0
-        return { rating, predicted, residualPct }
-      })
-  )
-
-  /** 按筛选条件过滤后的点据 */
-  const filteredRatings = computed<Rating[]>(() =>
-    ratings.value.filter((rating) => {
+  const filteredRatings = computed<RatingPoint[]>(() =>
+    ratingPoints.value.filter((point) => {
       const keyword = filter.value.keyword.trim()
       if (keyword.length > 0) {
-        const haystack = `${rating.measureNo}${rating.lineNo}${stationNameOf(rating.stationId)}`
+        const haystack = `${point.measureNo}${point.lineNo}${stationNameOf(point.stationId)}`
         if (!haystack.includes(keyword)) return false
       }
-      if (filter.value.stationIds.length > 0 && !filter.value.stationIds.includes(rating.stationId)) return false
-      if (filter.value.lineNos.length > 0 && !filter.value.lineNos.includes(rating.lineNo)) return false
+      if (filter.value.stationIds.length > 0 && !filter.value.stationIds.includes(point.stationId)) return false
+      if (filter.value.lineNos.length > 0 && !filter.value.lineNos.includes(point.lineNo)) return false
       if (filter.value.verdicts.length > 0) {
-        const compare = compares.value.find((item) => item.ratingId === rating.id)
-        if (!compare || !filter.value.verdicts.includes(compare.verdict)) return false
+        const residual = pointRows.value.find((row) => row.point.id === point.id)
+        const verdict = (residual?.verdict ?? '合格') as '合格' | '超限'
+        if (!filter.value.verdicts.includes(verdict)) return false
       }
       return true
     })
@@ -109,39 +153,50 @@ export const useRatingStore = defineStore('rating', () => {
       filter.value.verdicts.length > 0
   )
 
-  /** 比测行：比测记录 + 点据 + 测站名，导出页与分析清单消费 */
-  const compareRows = computed<CompareRow[]>(() =>
-    compares.value
-      .map((compare) => {
-        const rating = ratings.value.find((item) => item.id === compare.ratingId) ?? null
-        return {
-          compare,
-          rating,
-          stationName: rating ? stationNameOf(rating.stationId) : '点据已删除',
-          lineNo: rating?.lineNo ?? '-'
-        }
-      })
-      .sort((a, b) => Math.abs(b.compare.deviationPct) - Math.abs(a.compare.deviationPct))
+  /** 最新一轮比测结论（当前线） */
+  const latestRun = computed<CompareRun | null>(() => {
+    const runs = compareRuns.value
+      .filter((run) => run.lineNo === activeLineNo.value)
+      .sort((a, b) => b.createdAt - a.createdAt)
+    return runs[0] ?? null
+  })
+
+  /** 当前线历史结论批次（旧结论可查） */
+  const runsOfActiveLine = computed<CompareRun[]>(() =>
+    compareRuns.value
+      .filter((run) => run.lineNo === activeLineNo.value)
+      .sort((a, b) => b.createdAt - a.createdAt)
   )
 
-  const overLimitRows = computed<CompareRow[]>(() =>
-    compareRows.value.filter((row) => row.compare.verdict === '超限')
+  /** 全站送交失败待重试的批次数（导航徽标） */
+  const failedDispatchCount = computed<number>(
+    () => compareRuns.value.filter((run) => run.dispatchStatus === 'failed').length
   )
 
-  /** 定线质量派生值：平均残差与合格点占比 */
+  /** 最新结论的比测行（分析清单用） */
+  const compareRows = computed(() => {
+    const run = latestRun.value
+    if (!run) return []
+    return run.items
+      .map((item) => ({
+        run,
+        item,
+        stationName: stationNameOf(item.stationId),
+        lineNo: run.lineNo
+      }))
+      .sort((a, b) => Math.abs(b.item.deviationPct) - Math.abs(a.item.deviationPct))
+  })
+
+  const overLimitRows = computed(() => compareRows.value.filter((row) => row.item.verdict === '超限'))
+
   const fitQuality = computed(() => {
-    const valid = allFits.value.filter((fit) => fit.valid)
-    const meanResidual = valid.length
-      ? Number((valid.reduce((sum, fit) => sum + fit.meanResidualPct, 0) / valid.length).toFixed(2))
-      : 0
-    const total = compareRows.value.length
-    const over = overLimitRows.value.length
+    const run = latestRun.value
     return {
-      validLineCount: valid.length,
-      meanResidualPct: meanResidual,
-      compareCount: total,
-      overLimitCount: over,
-      qualifyRatePct: total === 0 ? 0 : Number((((total - over) / total) * 100).toFixed(1))
+      compareCount: run?.total ?? 0,
+      overLimitCount: run?.overLimit ?? 0,
+      qualifyRatePct: run?.qualifyRatePct ?? 0,
+      meanResidualPct: run?.meanResidualPct ?? 0,
+      valid: run?.valid ?? false
     }
   })
 
@@ -157,134 +212,138 @@ export const useRatingStore = defineStore('rating', () => {
     activeLineNo.value = lineNo
   }
 
-  function setFit(fit: RatingFitResult): void {
-    const others = fits.value.filter((item) => item.lineNo !== fit.lineNo)
-    fits.value = [...others, fit]
-  }
-
   function setDeviationLimit(limit: number): void {
     deviationLimitPct.value = limit
   }
 
-  async function createRating(
-    payload: Omit<Rating, 'id' | 'createdAt' | 'updatedAt'>
-  ): Promise<Rating> {
-    const now = Date.now()
-    const row: Rating = { ...payload, id: createId('rat'), createdAt: now, updatedAt: now }
-    await db.ratings.put(row)
-    return row
+  function setOperator(name: string): void {
+    operator.value = name
   }
 
-  async function updateRating(id: string, patch: Partial<Rating>): Promise<void> {
-    await db.ratings.update(id, { ...patch, updatedAt: Date.now() } as never)
+  /** 可落点的报出成果（当前线、未被取代、未在案） */
+  async function reportOptions(lineNo: string): Promise<ReportOption[]> {
+    return availableReports(lineNo)
   }
 
-  async function removeRating(id: string): Promise<void> {
-    await db.transaction('rw', [db.ratings, db.compares], async () => {
-      await db.compares.where('ratingId').equals(id).delete()
-      await db.ratings.delete(id)
-    })
+  /** 由外业报出成果落点据（唯一合法新增入口） */
+  async function addPointFromReport(reportId: string, lineNo: string): Promise<RatingPoint> {
+    const point = await createPointFromReport({ reportId, lineNo, stationId: '' })
+    return point
+  }
+
+  async function editPoint(id: string, patch: Partial<RatingPoint>): Promise<void> {
+    await updatePoint(id, patch)
+  }
+
+  async function changePointLine(id: string, lineNo: string): Promise<void> {
+    await movePointLine(id, lineNo)
+  }
+
+  async function deletePoint(id: string): Promise<void> {
+    await removePoint(id)
+  }
+
+  async function resolvePoint(id: string, note: string): Promise<void> {
+    await reviewPoint({ id, action: 'resolve', reviewer: operator.value, note })
+  }
+
+  async function rejectPoint(id: string, note: string): Promise<void> {
+    await reviewPoint({ id, action: 'reject', reviewer: operator.value, note })
+  }
+
+  async function addLine(lineNo: string, stationId: string, label?: string): Promise<void> {
+    await ensureLine(lineNo, stationId, label)
+  }
+
+  /** 重新定线：追加比测结论批次（旧结论留存），并送交外业 */
+  async function refitAndDispatch(lineNo?: string): Promise<{ run: CompareRun; fit: RatingFitResult }> {
+    const target = lineNo ?? activeLineNo.value
+    const usable = await fittingPoints(target)
+    if (usable.length === 0) {
+      throw new Error('当前定线号没有在案点据，无法定线')
+    }
+    const { run } = await refitLine({ lineNo: target, operator: operator.value, deviationLimitPct: deviationLimitPct.value })
+    await dispatchConclusion(run.id)
+    return { run, fit: activeFit.value }
+  }
+
+  /** 仅重定线出结论，暂不送交（用户也可稍后在档案页送交） */
+  async function refitOnly(lineNo?: string): Promise<CompareRun> {
+    const target = lineNo ?? activeLineNo.value
+    const usable = await fittingPoints(target)
+    if (usable.length === 0) throw new Error('当前定线号没有在案点据，无法定线')
+    const { run } = await refitLine({ lineNo: target, operator: operator.value, deviationLimitPct: deviationLimitPct.value })
+    return run
+  }
+
+  /** 送交某条历史结论批次 */
+  async function sendRun(runId: string): Promise<void> {
+    await dispatchConclusion(runId)
   }
 
   /**
-   * 由点据生成 / 刷新比测记录：曲线流量取当前定线拟合值，
-   * 偏差超过限值自动判定超限并进入分析清单。
+   * 整编室按本侧重试送交：只刷整编室 outbox，再回填批次状态。
+   * 外业库除了在通道恢复时接收 inbox 外不做任何改动。
    */
-  async function rebuildCompares(lineNo?: string): Promise<number> {
-    const targetLine = lineNo ?? activeLineNo.value
-    const fit = fitPowerCurve(
-      ratings.value
-        .filter((rating) => rating.lineNo === targetLine)
-        .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s })),
-      targetLine
-    )
-    setFit(fit)
-    const targets = ratings.value.filter((rating) => rating.lineNo === targetLine)
-    if (targets.length === 0) return 0
-    const now = Date.now()
-    const rows: Compare[] = targets.map((rating) => {
-      const predicted = fit.valid ? curveFlow(fit, rating.stageM) : rating.flowM3s
-      const deviationPct = calcDeviationPct(rating.flowM3s, predicted)
-      const existing = compares.value.find((item) => item.ratingId === rating.id)
-      return {
-        id: existing?.id ?? createId('cmp'),
-        ratingId: rating.id,
-        measuredFlow: rating.flowM3s,
-        curveFlow: predicted,
-        deviationPct,
-        verdict: judgeDeviation(deviationPct, deviationLimitPct.value),
-        operator: existing?.operator ?? '林昭',
-        comparedAt: existing?.comparedAt ?? rating.measuredAt,
-        createdAt: existing?.createdAt ?? now,
-        updatedAt: now
-      }
-    })
-    await db.compares.bulkPut(rows)
-    return rows.length
+  async function retryDispatch(): Promise<{ sent: number; stillFailing: number }> {
+    const result = await retrySide('office')
+    await syncAllRunDispatchStates()
+    return result
   }
 
-  /** 手工登记比测记录（导出页分析清单用） */
-  async function createCompare(
-    payload: Omit<Compare, 'id' | 'createdAt' | 'updatedAt' | 'deviationPct' | 'verdict'> & {
-      deviationPct?: number
-      verdict?: Compare['verdict']
-    }
-  ): Promise<Compare> {
-    const now = Date.now()
-    const deviationPct =
-      payload.deviationPct ?? calcDeviationPct(payload.measuredFlow, payload.curveFlow)
-    const row: Compare = {
-      ...payload,
-      deviationPct,
-      verdict: payload.verdict ?? judgeDeviation(deviationPct, deviationLimitPct.value),
-      id: createId('cmp'),
-      createdAt: now,
-      updatedAt: now
-    }
-    await db.compares.put(row)
-    return row
-  }
-
-  async function updateCompare(id: string, patch: Partial<Compare>): Promise<void> {
-    await db.compares.update(id, { ...patch, updatedAt: Date.now() } as never)
-  }
-
-  async function removeCompare(id: string): Promise<void> {
-    await db.compares.delete(id)
+  async function syncDispatchStates(): Promise<void> {
+    await syncAllRunDispatchStates()
   }
 
   return {
-    ratings,
-    compares,
+    // state
     stations,
+    reports,
+    ratingPoints,
+    ratingLines,
+    compareRuns,
     ready,
     error,
     filter,
     activeLineNo,
-    activeFit,
-    fits,
     deviationLimitPct,
+    operator,
+    // derived
     lineNos,
-    allFits,
+    pointsOfActiveLine,
+    fittingPointsOfActiveLine,
+    heldPoints,
+    activeFit,
     pointRows,
     filteredRatings,
     hasFilter,
+    latestRun,
+    runsOfActiveLine,
+    failedDispatchCount,
     compareRows,
     overLimitRows,
     fitQuality,
+    // lifecycle / actions
     start,
+    refreshInbox,
     stationNameOf,
     patchFilter,
     resetFilter,
     setActiveLine,
-    setFit,
     setDeviationLimit,
-    createRating,
-    updateRating,
-    removeRating,
-    rebuildCompares,
-    createCompare,
-    updateCompare,
-    removeCompare
+    setOperator,
+    reportOptions,
+    addPointFromReport,
+    editPoint,
+    changePointLine,
+    deletePoint,
+    resolvePoint,
+    rejectPoint,
+    addLine,
+    refitAndDispatch,
+    refitOnly,
+    sendRun,
+    retryDispatch,
+    syncDispatchStates
   }
 })

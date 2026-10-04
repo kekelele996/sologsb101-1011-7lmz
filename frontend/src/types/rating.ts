@@ -1,22 +1,3 @@
-/** 水位流量关系点据：参与幂函数定线的实测点 */
-export interface Rating {
-  id: string
-  /** 所属测站 */
-  stationId: string
-  /** 水位（m） */
-  stageM: number
-  /** 流量（m³/s） */
-  flowM3s: number
-  /** 定线号：同一定线号的点据参与同一组拟合 */
-  lineNo: string
-  /** 点据来源测次号 */
-  measureNo: string
-  /** 点据时间 */
-  measuredAt: string
-  createdAt: number
-  updatedAt: number
-}
-
 /** 幂函数定线结果：Q = a * (H - H0)^b */
 export interface RatingFitResult {
   lineNo: string
@@ -38,6 +19,12 @@ export interface RatingFitResult {
   valid: boolean
   /** 不可定线时的说明 */
   message: string
+}
+
+/** 参与拟合/比测的点据最小结构（整编室点据、导出快照均可喂入） */
+export interface RatingSample {
+  stageM: number
+  flowM3s: number
 }
 
 /** 关系点据页筛选条件（存于 ratingStore） */

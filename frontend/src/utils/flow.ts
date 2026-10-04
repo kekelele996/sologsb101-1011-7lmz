@@ -58,7 +58,15 @@ export interface DischargeResult {
   /** 水面宽（m） */
   widthM: number
   /** 逐垂线的部分面积与部分流量 */
-  slices: Array<{ id: string; no: number; partialAreaM2: number; partialFlow: number }>
+  slices: Array<{
+    id: string
+    no: number
+    startDistanceM: number
+    depthM: number
+    meanVelocityMs: number
+    partialAreaM2: number
+    partialFlow: number
+  }>
 }
 
 /**
@@ -89,7 +97,17 @@ export function calcSectionDischarge(input: VerticalSlice[]): DischargeResult {
       meanVelocityMs: round(only.meanVelocityMs, 3),
       maxDepthM: round(only.depthM, 2),
       widthM: 0,
-      slices: [{ id: only.id, no: only.no, partialAreaM2, partialFlow }]
+      slices: [
+        {
+          id: only.id,
+          no: only.no,
+          startDistanceM: only.startDistanceM,
+          depthM: only.depthM,
+          meanVelocityMs: only.meanVelocityMs,
+          partialAreaM2,
+          partialFlow
+        }
+      ]
     }
   }
 
@@ -101,7 +119,15 @@ export function calcSectionDischarge(input: VerticalSlice[]): DischargeResult {
     const span = index === 0 || index === verticals.length - 1 ? leftSpan + rightSpan : leftSpan + rightSpan
     const partialAreaM2 = round(vertical.depthM * span, 3)
     const partialFlow = round(partialAreaM2 * vertical.meanVelocityMs, 3)
-    return { id: vertical.id, no: vertical.no, partialAreaM2, partialFlow }
+    return {
+      id: vertical.id,
+      no: vertical.no,
+      startDistanceM: vertical.startDistanceM,
+      depthM: vertical.depthM,
+      meanVelocityMs: vertical.meanVelocityMs,
+      partialAreaM2,
+      partialFlow
+    }
   })
 
   const areaM2 = round(
